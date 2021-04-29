@@ -25,25 +25,89 @@ void TA_DestroyEntryPoint(void)
 	pkcs11_deinit();
 }
 
-TEE_Result TA_OpenSessionEntryPoint(uint32_t __unused param_types,
-				    TEE_Param __unused params[4],
+TEE_Result TA_OpenSessionEntryPoint(uint32_t param_types,
+				    TEE_Param params[4],
 				    void **tee_session)
 {
-	struct pkcs11_client *client = register_client();
+	const uint32_t exp_pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
+						TEE_PARAM_TYPE_NONE,
+						TEE_PARAM_TYPE_NONE,
+						TEE_PARAM_TYPE_NONE);
+	struct pkcs11_client *client = NULL;
+	struct ck_token *token = NULL;
+	TEE_Identity identity = { };
+	TEE_Result res = TEE_SUCCESS;
+	void *ca_token_temp_list = NULL;
 
-	if (!client)
+	if (param_types != exp_pt ||
+	    params[0].memref.size != CLIENT_SALT_SIZE)
+		return TEE_ERROR_BAD_PARAMETERS;
+
+	res = TEE_GetPropertyAsIdentity(TEE_PROPSET_CURRENT_CLIENT,
+					"gpd.client.identity", &identity);
+	if (res != TEE_SUCCESS) {
+		EMSG("TEE_GetPropertyAsIdentity: returned %#"PRIx32, res);
+		return TEE_ERROR_SECURITY;
+	}
+
+	/* create a new token or find existed one */
+	token = create_token(&identity);
+	if (!token) {
+		EMSG("Couldn't create a new token");
 		return TEE_ERROR_OUT_OF_MEMORY;
+	}
 
-	*tee_session = client;
+	*tee_session = NULL;
+
+	/*
+	 * Several CAs can simultaniously create own tokens.
+	 * To separate CA1's tokens from CAn's token we use
+	 * so called 'client salt'. It's random bytes which CA passes to TA
+	 * during opening a tee session.
+	 *
+	 * Until all CA tokens won't be created we keep them in an internal
+	 * temp list. If deferent CAs tries to create own tokens simultaniously
+	 * (in turn) there will be several different temp lists.
+	 */
+	ca_token_temp_list = reg_in_temp_ca_token_list(token,
+						       params[0].memref.buffer);
+	if (!ca_token_temp_list) {
+		EMSG("Couldn't add a new token to client token list");
+		remove_token(token);
+		return TEE_ERROR_OUT_OF_MEMORY;
+	}
+
+	switch (identity.login) {
+	case TEE_LOGIN_USER:
+	case TEE_LOGIN_APPLICATION:
+		break;
+	case TEE_LOGIN_APPLICATION_USER:
+		client = register_client(ca_token_temp_list);
+		remove_temp_ca_token_list(ca_token_temp_list);
+
+		if (!client) {
+			EMSG("Couldn't register a new client");
+			*tee_session = NULL;
+
+			remove_token(token);
+			return TEE_ERROR_OUT_OF_MEMORY;
+		}
+
+		*tee_session = client;
+		break;
+	default:
+		break;
+	}
 
 	return TEE_SUCCESS;
 }
 
 void TA_CloseSessionEntryPoint(void *tee_session)
 {
-	struct pkcs11_client *client = tee_session2client(tee_session);
+	if (!tee_session)
+		return;
 
-	unregister_client(client);
+	unregister_client(tee_session2client(tee_session));
 }
 
 /*
@@ -158,19 +222,19 @@ TEE_Result TA_InvokeCommandEntryPoint(void *tee_session, uint32_t cmd,
 		break;
 
 	case PKCS11_CMD_SLOT_LIST:
-		rc = entry_ck_slot_list(ptypes, params);
+		rc = entry_ck_slot_list(client, ptypes, params);
 		break;
 	case PKCS11_CMD_SLOT_INFO:
-		rc = entry_ck_slot_info(ptypes, params);
+		rc = entry_ck_slot_info(client, ptypes, params);
 		break;
 	case PKCS11_CMD_TOKEN_INFO:
-		rc = entry_ck_token_info(ptypes, params);
+		rc = entry_ck_token_info(client, ptypes, params);
 		break;
 	case PKCS11_CMD_MECHANISM_IDS:
-		rc = entry_ck_token_mecha_ids(ptypes, params);
+		rc = entry_ck_token_mecha_ids(client, ptypes, params);
 		break;
 	case PKCS11_CMD_MECHANISM_INFO:
-		rc = entry_ck_token_mecha_info(ptypes, params);
+		rc = entry_ck_token_mecha_info(client, ptypes, params);
 		break;
 
 	case PKCS11_CMD_OPEN_SESSION:
@@ -187,7 +251,7 @@ TEE_Result TA_InvokeCommandEntryPoint(void *tee_session, uint32_t cmd,
 		break;
 
 	case PKCS11_CMD_INIT_TOKEN:
-		rc = entry_ck_token_initialize(ptypes, params);
+		rc = entry_ck_token_initialize(client, ptypes, params);
 		break;
 	case PKCS11_CMD_INIT_PIN:
 		rc = entry_ck_init_pin(client, ptypes, params);

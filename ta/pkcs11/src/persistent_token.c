@@ -14,38 +14,12 @@
 #include "pkcs11_token.h"
 #include "pkcs11_helpers.h"
 
-#define PERSISTENT_OBJECT_ID_LEN	32
-
-/*
- * Token persistent objects
- *
- * The persistent objects are each identified by a UUID.
- * The persistent object database stores the list of the UUIDs registered. For
- * each it is expected that a file of ID "UUID" is stored in the TA secure
- * storage.
- */
-static TEE_Result get_db_file_name(struct ck_token *token,
-				   char *name, size_t size)
-{
-	int n = snprintf(name, size, "token.db.%u", get_token_id(token));
-
-	if (n < 0 || (size_t)n >= size)
-		return TEE_ERROR_SECURITY;
-	else
-		return TEE_SUCCESS;
-}
-
 static TEE_Result open_db_file(struct ck_token *token,
 			       TEE_ObjectHandle *out_hdl)
 {
-	char file[PERSISTENT_OBJECT_ID_LEN] = { };
-	TEE_Result res = TEE_ERROR_GENERIC;
-
-	res = get_db_file_name(token, file, sizeof(file));
-	if (res)
-		return res;
-
-	return TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE, file, sizeof(file),
+	return TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE,
+					&token->token_db_id.uuid,
+					sizeof(TEE_UUID),
 					TEE_DATA_FLAG_ACCESS_READ |
 					TEE_DATA_FLAG_ACCESS_WRITE,
 					out_hdl);
@@ -286,8 +260,22 @@ enum pkcs11_rc verify_identity_auth(struct ck_token *token,
 /*
  * Release resources relate to persistent database
  */
-void close_persistent_db(struct ck_token *token __unused)
+void close_persistent_db(struct ck_token *token)
 {
+	struct pkcs11_object *obj = NULL;
+
+	if (!token)
+		return;
+
+	while (!LIST_EMPTY(&token->object_list)) {
+		obj = LIST_FIRST(&token->object_list);
+		LIST_REMOVE(obj, link);
+		TEE_Free(obj->uuid);
+		TEE_Free(obj);
+	}
+
+	TEE_Free(token->db_objs);
+	TEE_Free(token->db_main);
 }
 
 static int get_persistent_obj_idx(struct ck_token *token, TEE_UUID *uuid)
@@ -575,9 +563,8 @@ out:
  * Return the token instance, either initialized from reset or initialized
  * from the token persistent state if found.
  */
-struct ck_token *init_persistent_db(unsigned int token_id)
+struct ck_token *init_persistent_db(struct ck_token *token)
 {
-	struct ck_token *token = get_token(token_id);
 	TEE_Result res = TEE_ERROR_GENERIC;
 	TEE_ObjectHandle db_hdl = TEE_HANDLE_NULL;
 	/* Copy persistent database: main db and object db */
@@ -596,12 +583,11 @@ struct ck_token *init_persistent_db(unsigned int token_id)
 		goto error;
 
 	res = open_db_file(token, &db_hdl);
-
 	if (res == TEE_SUCCESS) {
 		uint32_t size = 0;
 		size_t idx = 0;
 
-		IMSG("PKCS11 token %u: load db", token_id);
+		IMSG("PKCS11 <%s>: load db", token->filename);
 
 		size = sizeof(*db_main);
 		res = TEE_ReadObjectData(db_hdl, db_main, size, &size);
@@ -647,9 +633,7 @@ struct ck_token *init_persistent_db(unsigned int token_id)
 		}
 
 	} else if (res == TEE_ERROR_ITEM_NOT_FOUND) {
-		char file[PERSISTENT_OBJECT_ID_LEN] = { };
-
-		IMSG("PKCS11 token %u: init db", token_id);
+		IMSG("PKCS11 <%s>: init db", token->filename);
 
 		TEE_MemFill(db_main, 0, sizeof(*db_main));
 		TEE_MemFill(db_main->label, '*', sizeof(db_main->label));
@@ -660,16 +644,13 @@ struct ck_token *init_persistent_db(unsigned int token_id)
 				 PKCS11_CKFT_DUAL_CRYPTO_OPERATIONS |
 				 PKCS11_CKFT_LOGIN_REQUIRED;
 
-		res = get_db_file_name(token, file, sizeof(file));
-		if (res)
-			TEE_Panic(0);
-
 		/*
 		 * Object stores persistent state + persistent object
 		 * references.
 		 */
 		res = TEE_CreatePersistentObject(TEE_STORAGE_PRIVATE,
-						 file, sizeof(file),
+						 &token->token_db_id.uuid,
+						 sizeof(TEE_UUID),
 						 TEE_DATA_FLAG_ACCESS_READ |
 						 TEE_DATA_FLAG_ACCESS_WRITE,
 						 TEE_HANDLE_NULL,

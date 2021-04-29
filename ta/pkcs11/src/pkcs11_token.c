@@ -24,13 +24,6 @@
 #include "serializer.h"
 #include "token_capabilities.h"
 
-/* Provide 3 slots/tokens, ID is token index */
-#ifndef CFG_PKCS11_TA_TOKEN_COUNT
-#define TOKEN_COUNT		3
-#else
-#define TOKEN_COUNT		CFG_PKCS11_TA_TOKEN_COUNT
-#endif
-
 /* RNG chunk size used to split RNG generation to smaller sizes */
 #define RNG_CHUNK_SIZE		512U
 
@@ -39,38 +32,45 @@
  *
  * @link - chained list of registered client applications
  * @sessions - list of the PKCS11 sessions opened by the client application
+ * @token_list - tokens related to this particular client application
+ * @token_cnt - count of tokens which belong this CA
  * @object_handle_db - Database for object handles in name space of client
  */
 struct pkcs11_client {
 	TAILQ_ENTRY(pkcs11_client) link;
 	struct session_list session_list;
+	struct client_token_list token_list;
+	uint32_t token_cnt;
 	struct handle_db session_handle_db;
 	struct handle_db object_handle_db;
 };
 
-/* Static allocation of tokens runtime instances (reset to 0 at load) */
-struct ck_token ck_token[TOKEN_COUNT];
+struct client_token_temp {
+	TAILQ_ENTRY(client_token_temp) link;
+	struct ck_token *token;
+};
+TAILQ_HEAD(client_token_temp_list, client_token_temp);
+
+struct client_init_in_progess {
+	TAILQ_ENTRY(client_init_in_progess) link;
+	struct client_token_temp_list client_token_temp_list;
+	char client_salt[CLIENT_SALT_SIZE];
+};
+TAILQ_HEAD(client_init_in_progess_list, client_init_in_progess);
 
 static struct client_list pkcs11_client_list =
 	TAILQ_HEAD_INITIALIZER(pkcs11_client_list);
 
+/* common list of currently loaded tokens */
+static struct token_list pkcs11_token_list = 
+	TAILQ_HEAD_INITIALIZER(pkcs11_token_list);
+
+static struct client_init_in_progess_list all_ca_init_in_progess_list =
+	TAILQ_HEAD_INITIALIZER(all_ca_init_in_progess_list);
+
 static void close_ck_session(struct pkcs11_session *session);
-
-struct ck_token *get_token(unsigned int token_id)
-{
-	if (token_id < TOKEN_COUNT)
-		return &ck_token[confine_array_index(token_id, TOKEN_COUNT)];
-
-	return NULL;
-}
-
-unsigned int get_token_id(struct ck_token *token)
-{
-	ptrdiff_t id = token - ck_token;
-
-	assert(id >= 0 && id < TOKEN_COUNT);
-	return id;
-}
+static struct ck_token *get_token(struct pkcs11_client *client, uint32_t slot);
+static uint32_t get_token_id(struct pkcs11_client *client, struct ck_token *token);
 
 struct handle_db *get_object_handle_db(struct pkcs11_session *session)
 {
@@ -99,9 +99,143 @@ struct pkcs11_session *pkcs11_handle2session(uint32_t handle,
 	return handle_lookup(&client->session_handle_db, handle);
 }
 
-struct pkcs11_client *register_client(void)
+struct ck_token *create_token(TEE_Identity *token_db_id)
+{
+	struct ck_token *token = NULL;
+
+	if (!token_db_id)
+		return NULL;
+
+	/* check that token doesn't already exist */
+	TAILQ_FOREACH(token, &pkcs11_token_list, link) {
+		if (!TEE_MemCompare(&token_db_id->uuid,
+				    &token->token_db_id.uuid,
+				    sizeof(TEE_UUID))) {
+			++token->ref_count;
+			goto token_found;
+		}
+	}
+
+	token = TEE_Malloc(sizeof(*token), TEE_MALLOC_FILL_ZERO);
+	if (!token)
+		return NULL;
+
+	/* As per PKCS#11 spec, token resets to read/write state */
+	token->state = PKCS11_TOKEN_READ_WRITE;
+	token->session_count = 0;
+	token->rw_session_count = 0;
+	token->ref_count = 1;
+
+	TEE_MemMove(&token->token_db_id, token_db_id, sizeof(TEE_Identity));
+
+	/* Insert a new token to common list of all tokens */
+	TAILQ_INSERT_HEAD(&pkcs11_token_list, token, link);
+
+token_found:
+	return token;
+}
+
+void *reg_in_temp_ca_token_list(struct ck_token *token,
+				char client_salt[CLIENT_SALT_SIZE])
+{
+	struct client_init_in_progess *ca_in_prog = NULL;
+	struct client_token_temp *temp_token = NULL;
+
+	if (!token || !client_salt)
+		return NULL;
+
+	TAILQ_FOREACH(ca_in_prog, &all_ca_init_in_progess_list, link) {
+		if (!TEE_MemCompare(ca_in_prog->client_salt, client_salt,
+				    CLIENT_SALT_SIZE)) {
+			temp_token = TEE_Malloc(sizeof(*temp_token),
+						TEE_MALLOC_FILL_ZERO);
+			if (!temp_token)
+				return NULL;
+
+			temp_token->token = token;
+			TAILQ_INSERT_HEAD(&ca_in_prog->client_token_temp_list,
+					  temp_token, link);
+
+			return ca_in_prog;
+		}
+	}
+
+	/* New CA has started to init own tokens */
+	ca_in_prog = TEE_Malloc(sizeof(*ca_in_prog), TEE_MALLOC_FILL_ZERO);
+	if (!ca_in_prog)
+		return NULL;
+
+	/* New element in temp token list for particular CA */
+	temp_token = TEE_Malloc(sizeof(*temp_token), TEE_MALLOC_FILL_ZERO);
+	if (!temp_token) {
+		TEE_Free(ca_in_prog);
+		return NULL;
+	}
+
+	temp_token->token = token;
+
+	TEE_MemMove(ca_in_prog->client_salt, client_salt, CLIENT_SALT_SIZE);
+	TAILQ_INIT(&ca_in_prog->client_token_temp_list);
+	TAILQ_INSERT_HEAD(&ca_in_prog->client_token_temp_list, temp_token,
+			  link);
+	TAILQ_INSERT_HEAD(&all_ca_init_in_progess_list, ca_in_prog, link);
+
+	return ca_in_prog;
+}
+
+void remove_temp_ca_token_list(void *ca_token_temp_list)
+{
+	struct client_init_in_progess *ca_in_prog = NULL;
+	struct client_token_temp *temp_token = NULL;
+
+	if (!ca_token_temp_list)
+		return;
+
+	TAILQ_FOREACH(ca_in_prog, &all_ca_init_in_progess_list, link) {
+		if (ca_in_prog == ca_token_temp_list) {
+			while (!TAILQ_EMPTY(&ca_in_prog->
+					   client_token_temp_list)) {
+				temp_token = TAILQ_FIRST(
+					&ca_in_prog->client_token_temp_list);
+				TAILQ_REMOVE(&ca_in_prog->
+					     client_token_temp_list,
+					     temp_token,
+					     link);
+				TEE_Free(temp_token);
+			}
+			break;
+		}
+	}
+
+	TAILQ_REMOVE(&all_ca_init_in_progess_list, ca_in_prog, link);
+	TEE_Free(ca_in_prog);
+}
+
+void remove_token(struct ck_token *token)
+{
+	if (!token)
+		return;
+
+	if (token->ref_count > 1) {
+		--token->ref_count;
+	} else {
+		TAILQ_REMOVE(&pkcs11_token_list, token, link);
+		close_persistent_db(token);
+		TEE_Free(token);
+	}
+}
+
+struct pkcs11_client *register_client(void *ca_token_temp_list)
 {
 	struct pkcs11_client *client = NULL;
+	struct client_token *client_token = NULL;
+	struct client_token_temp *temp_token = NULL;
+	struct client_init_in_progess *ca_in_prog = ca_token_temp_list;
+	uint32_t client_token_cnt = 0;
+
+	if (!ca_token_temp_list)
+		return NULL;
+
 
 	client = TEE_Malloc(sizeof(*client), TEE_MALLOC_FILL_ZERO);
 	if (!client)
@@ -109,9 +243,36 @@ struct pkcs11_client *register_client(void)
 
 	TAILQ_INSERT_HEAD(&pkcs11_client_list, client, link);
 	TAILQ_INIT(&client->session_list);
+	TAILQ_INIT(&client->token_list);
 	handle_db_init(&client->session_handle_db);
 	handle_db_init(&client->object_handle_db);
 
+	/* Copy available for this client tokens and create slots */
+	TAILQ_FOREACH(temp_token, &ca_in_prog->client_token_temp_list, link) {
+		client_token = TEE_Malloc(sizeof(*client_token),
+					  TEE_MALLOC_FILL_ZERO);
+		if (!client_token) {
+			TEE_Free(client);
+			return NULL;
+		}
+
+		client_token->token = temp_token->token;
+		client_token->slot = client_token_cnt;
+		++client_token_cnt;
+
+		/* load persistance database into RAM */
+		if (!init_persistent_db(client_token->token)) {
+			EMSG("Init database for token  %#"PRIx32" failed",
+			     (int)client_token->token);
+			TEE_Free(client_token);
+			TEE_Free(client);
+			return NULL;
+		}
+
+		TAILQ_INSERT_HEAD(&client->token_list, client_token, link);
+	}
+
+	client->token_cnt = client_token_cnt;
 	return client;
 }
 
@@ -119,6 +280,7 @@ void unregister_client(struct pkcs11_client *client)
 {
 	struct pkcs11_session *session = NULL;
 	struct pkcs11_session *next = NULL;
+	struct client_token *client_token = NULL;
 
 	if (!client) {
 		EMSG("Invalid TEE session handle");
@@ -128,49 +290,25 @@ void unregister_client(struct pkcs11_client *client)
 	TAILQ_FOREACH_SAFE(session, &client->session_list, link, next)
 		close_ck_session(session);
 
+	/* Delete all token and RAM database for this client */
+	TAILQ_FOREACH(client_token, &client->token_list, link)
+		remove_token(client_token->token);
+		
+
 	TAILQ_REMOVE(&pkcs11_client_list, client, link);
 	handle_db_destroy(&client->object_handle_db);
 	handle_db_destroy(&client->session_handle_db);
 	TEE_Free(client);
 }
 
-static TEE_Result pkcs11_token_init(unsigned int id)
-{
-	struct ck_token *token = init_persistent_db(id);
-
-	if (!token)
-		return TEE_ERROR_SECURITY;
-
-	if (token->state == PKCS11_TOKEN_RESET) {
-		/* As per PKCS#11 spec, token resets to read/write state */
-		token->state = PKCS11_TOKEN_READ_WRITE;
-		token->session_count = 0;
-		token->rw_session_count = 0;
-	}
-
-	return TEE_SUCCESS;
-}
-
 TEE_Result pkcs11_init(void)
 {
-	unsigned int id = 0;
-	TEE_Result ret = TEE_ERROR_GENERIC;
-
-	for (id = 0; id < TOKEN_COUNT; id++) {
-		ret = pkcs11_token_init(id);
-		if (ret)
-			break;
-	}
-
-	return ret;
+	return TEE_SUCCESS;
 }
 
 void pkcs11_deinit(void)
 {
-	unsigned int id = 0;
 
-	for (id = 0; id < TOKEN_COUNT; id++)
-		close_persistent_db(get_token(id));
 }
 
 /*
@@ -230,7 +368,8 @@ enum pkcs11_rc set_processing_state(struct pkcs11_session *session,
 	return PKCS11_CKR_OK;
 }
 
-enum pkcs11_rc entry_ck_slot_list(uint32_t ptypes, TEE_Param *params)
+enum pkcs11_rc entry_ck_slot_list(struct pkcs11_client *client,
+				  uint32_t ptypes, TEE_Param *params)
 {
 	const uint32_t exp_pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INOUT,
 						TEE_PARAM_TYPE_NONE,
@@ -238,12 +377,14 @@ enum pkcs11_rc entry_ck_slot_list(uint32_t ptypes, TEE_Param *params)
 						TEE_PARAM_TYPE_NONE);
 	TEE_Param *out = params + 2;
 	uint32_t token_id = 0;
-	const size_t out_size = sizeof(token_id) * TOKEN_COUNT;
+	size_t out_size = 0;
 	uint8_t *id = NULL;
 
-	if (ptypes != exp_pt ||
+	if (!client || ptypes != exp_pt ||
 	    params[0].memref.size != TEE_PARAM0_SIZE_MIN)
 		return PKCS11_CKR_ARGUMENTS_BAD;
+
+	out_size = sizeof(token_id) * client->token_cnt;
 
 	if (out->memref.size < out_size) {
 		out->memref.size = out_size;
@@ -254,7 +395,7 @@ enum pkcs11_rc entry_ck_slot_list(uint32_t ptypes, TEE_Param *params)
 			return PKCS11_CKR_OK;
 	}
 
-	for (token_id = 0, id = out->memref.buffer; token_id < TOKEN_COUNT;
+	for (token_id = 0, id = out->memref.buffer; token_id < client->token_cnt;
 	     token_id++, id += sizeof(token_id))
 		TEE_MemMove(id, &token_id, sizeof(token_id));
 
@@ -293,7 +434,35 @@ static void set_token_description(struct pkcs11_slot_info *info)
 	pad_str(info->slot_description, sizeof(info->slot_description));
 }
 
-enum pkcs11_rc entry_ck_slot_info(uint32_t ptypes, TEE_Param *params)
+static struct ck_token *get_token(struct pkcs11_client *client, uint32_t slot)
+{
+	struct client_token *client_token = NULL;
+
+	if (!client || slot > client->token_cnt - 1)
+		return NULL;
+
+	TAILQ_FOREACH(client_token, &client->token_list, link) {
+		if (client_token->slot == slot)
+			break;
+	}
+
+	return client_token->token;
+}
+
+static uint32_t get_token_id(struct pkcs11_client *client, struct ck_token *token)
+{
+	struct client_token *client_token = NULL;
+
+	TAILQ_FOREACH(client_token, &client->token_list, link) {
+		if (client_token->token == token)
+			break;
+	}
+
+	return client_token->slot;
+}
+
+enum pkcs11_rc entry_ck_slot_info(struct pkcs11_client *client,
+				  uint32_t ptypes, TEE_Param *params)
 {
 	const uint32_t exp_pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INOUT,
 						TEE_PARAM_TYPE_NONE,
@@ -317,7 +486,7 @@ enum pkcs11_rc entry_ck_slot_info(uint32_t ptypes, TEE_Param *params)
 	COMPILE_TIME_ASSERT(sizeof(PKCS11_SLOT_MANUFACTURER) <=
 			    sizeof(info.manufacturer_id));
 
-	if (ptypes != exp_pt || out->memref.size != sizeof(info))
+	if (!client || ptypes != exp_pt || out->memref.size != sizeof(info))
 		return PKCS11_CKR_ARGUMENTS_BAD;
 
 	serialargs_init(&ctrlargs, ctrl->memref.buffer, ctrl->memref.size);
@@ -329,7 +498,7 @@ enum pkcs11_rc entry_ck_slot_info(uint32_t ptypes, TEE_Param *params)
 	if (serialargs_remaining_bytes(&ctrlargs))
 		return PKCS11_CKR_ARGUMENTS_BAD;
 
-	if (!get_token(token_id))
+	if (!get_token(client, token_id))
 		return PKCS11_CKR_SLOT_ID_INVALID;
 
 	set_token_description(&info);
@@ -342,7 +511,8 @@ enum pkcs11_rc entry_ck_slot_info(uint32_t ptypes, TEE_Param *params)
 	return PKCS11_CKR_OK;
 }
 
-enum pkcs11_rc entry_ck_token_info(uint32_t ptypes, TEE_Param *params)
+enum pkcs11_rc entry_ck_token_info(struct pkcs11_client *client,
+				   uint32_t ptypes, TEE_Param *params)
 {
 	const uint32_t exp_pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INOUT,
 						TEE_PARAM_TYPE_NONE,
@@ -371,7 +541,7 @@ enum pkcs11_rc entry_ck_token_info(uint32_t ptypes, TEE_Param *params)
 	char sn[sizeof(info.serial_number) + 1] = { 0 };
 	int n = 0;
 
-	if (ptypes != exp_pt || out->memref.size != sizeof(info))
+	if (!client || ptypes != exp_pt || out->memref.size != sizeof(info))
 		return PKCS11_CKR_ARGUMENTS_BAD;
 
 	serialargs_init(&ctrlargs, ctrl->memref.buffer, ctrl->memref.size);
@@ -383,7 +553,7 @@ enum pkcs11_rc entry_ck_token_info(uint32_t ptypes, TEE_Param *params)
 	if (serialargs_remaining_bytes(&ctrlargs))
 		return PKCS11_CKR_ARGUMENTS_BAD;
 
-	token = get_token(token_id);
+	token = get_token(client, token_id);
 	if (!token)
 		return PKCS11_CKR_SLOT_ID_INVALID;
 
@@ -423,7 +593,8 @@ static void dmsg_print_supported_mechanism(unsigned int token_id __maybe_unused,
 		     token_id, array[n], id2str_mechanism(array[n]));
 }
 
-enum pkcs11_rc entry_ck_token_mecha_ids(uint32_t ptypes, TEE_Param *params)
+enum pkcs11_rc entry_ck_token_mecha_ids(struct pkcs11_client *client,
+					uint32_t ptypes, TEE_Param *params)
 {
 	const uint32_t exp_pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INOUT,
 						TEE_PARAM_TYPE_NONE,
@@ -438,7 +609,7 @@ enum pkcs11_rc entry_ck_token_mecha_ids(uint32_t ptypes, TEE_Param *params)
 	size_t count = 0;
 	uint32_t *array = NULL;
 
-	if (ptypes != exp_pt)
+	if (!client || ptypes != exp_pt)
 		return PKCS11_CKR_ARGUMENTS_BAD;
 
 	serialargs_init(&ctrlargs, ctrl->memref.buffer, ctrl->memref.size);
@@ -450,7 +621,7 @@ enum pkcs11_rc entry_ck_token_mecha_ids(uint32_t ptypes, TEE_Param *params)
 	if (serialargs_remaining_bytes(&ctrlargs))
 		return PKCS11_CKR_ARGUMENTS_BAD;
 
-	token = get_token(token_id);
+	token = get_token(client, token_id);
 	if (!token)
 		return PKCS11_CKR_SLOT_ID_INVALID;
 
@@ -479,7 +650,8 @@ enum pkcs11_rc entry_ck_token_mecha_ids(uint32_t ptypes, TEE_Param *params)
 	return rc;
 }
 
-enum pkcs11_rc entry_ck_token_mecha_info(uint32_t ptypes, TEE_Param *params)
+enum pkcs11_rc entry_ck_token_mecha_info(struct pkcs11_client *client,
+					 uint32_t ptypes, TEE_Param *params)
 {
 	const uint32_t exp_pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INOUT,
 						TEE_PARAM_TYPE_NONE,
@@ -494,7 +666,7 @@ enum pkcs11_rc entry_ck_token_mecha_info(uint32_t ptypes, TEE_Param *params)
 	struct ck_token *token = NULL;
 	struct pkcs11_mechanism_info info = { };
 
-	if (ptypes != exp_pt || out->memref.size != sizeof(info))
+	if (!client || ptypes != exp_pt || out->memref.size != sizeof(info))
 		return PKCS11_CKR_ARGUMENTS_BAD;
 
 	serialargs_init(&ctrlargs, ctrl->memref.buffer, ctrl->memref.size);
@@ -510,7 +682,7 @@ enum pkcs11_rc entry_ck_token_mecha_info(uint32_t ptypes, TEE_Param *params)
 	if (serialargs_remaining_bytes(&ctrlargs))
 		return PKCS11_CKR_ARGUMENTS_BAD;
 
-	token = get_token(token_id);
+	token = get_token(client, token_id);
 	if (!token)
 		return PKCS11_CKR_SLOT_ID_INVALID;
 
@@ -616,7 +788,7 @@ enum pkcs11_rc entry_ck_open_session(struct pkcs11_client *client,
 	if (serialargs_remaining_bytes(&ctrlargs))
 		return PKCS11_CKR_ARGUMENTS_BAD;
 
-	token = get_token(token_id);
+	token = get_token(client, token_id);
 	if (!token)
 		return PKCS11_CKR_SLOT_ID_INVALID;
 
@@ -748,7 +920,7 @@ enum pkcs11_rc entry_ck_close_all_sessions(struct pkcs11_client *client,
 	if (serialargs_remaining_bytes(&ctrlargs))
 		return PKCS11_CKR_ARGUMENTS_BAD;
 
-	token = get_token(token_id);
+	token = get_token(client, token_id);
 	if (!token)
 		return PKCS11_CKR_SLOT_ID_INVALID;
 
@@ -789,7 +961,7 @@ enum pkcs11_rc entry_ck_session_info(struct pkcs11_client *client,
 	if (serialargs_remaining_bytes(&ctrlargs))
 		return PKCS11_CKR_ARGUMENTS_BAD;
 
-	info.slot_id = get_token_id(session->token);
+	info.slot_id = get_token_id(client, session->token);
 	info.state = session->state;
 	if (pkcs11_session_is_read_write(session))
 		info.flags |= PKCS11_CKFSS_RW_SESSION;
@@ -801,14 +973,14 @@ enum pkcs11_rc entry_ck_session_info(struct pkcs11_client *client,
 	return PKCS11_CKR_OK;
 }
 
-enum pkcs11_rc entry_ck_token_initialize(uint32_t ptypes, TEE_Param *params)
+enum pkcs11_rc entry_ck_token_initialize(struct pkcs11_client *client,
+					 uint32_t ptypes, TEE_Param *params)
 {
 	const uint32_t exp_pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INOUT,
 						TEE_PARAM_TYPE_NONE,
 						TEE_PARAM_TYPE_NONE,
 						TEE_PARAM_TYPE_NONE);
 	char label[PKCS11_TOKEN_LABEL_SIZE] = { 0 };
-	struct pkcs11_client *client = NULL;
 	struct pkcs11_session *sess = NULL;
 	enum pkcs11_rc rc = PKCS11_CKR_OK;
 	struct serialargs ctrlargs = { };
@@ -843,7 +1015,7 @@ enum pkcs11_rc entry_ck_token_initialize(uint32_t ptypes, TEE_Param *params)
 	if (serialargs_remaining_bytes(&ctrlargs))
 		return PKCS11_CKR_ARGUMENTS_BAD;
 
-	token = get_token(token_id);
+	token = get_token(client, token_id);
 	if (!token)
 		return PKCS11_CKR_SLOT_ID_INVALID;
 

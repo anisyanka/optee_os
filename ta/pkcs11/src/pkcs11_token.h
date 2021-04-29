@@ -14,6 +14,8 @@
 #include "object.h"
 #include "pkcs11_attributes.h"
 
+#define CLIENT_SALT_SIZE		16
+
 /* Hard coded description */
 #define PKCS11_SLOT_DESCRIPTION		"OP-TEE PKCS11 TA"
 #define PKCS11_SLOT_MANUFACTURER	"Linaro"
@@ -35,6 +37,8 @@ enum pkcs11_token_state {
 
 TAILQ_HEAD(client_list, pkcs11_client);
 TAILQ_HEAD(session_list, pkcs11_session);
+TAILQ_HEAD(token_list, ck_token);
+TAILQ_HEAD(client_token_list, client_token);
 
 struct pkcs11_client;
 
@@ -87,23 +91,42 @@ struct token_persistent_objs {
 };
 
 /*
- * Runtime state of the token, complies with pkcs11
+ * Token instance
  *
+ * @link - list of all tokens
+ * @token_db_id - id of token persistent object.
  * @state - Pkcs11 login is public, user, SO or custom
+ * @ref_count - reference counter
  * @session_count - Counter for opened Pkcs11 sessions
  * @rw_session_count - Count for opened Pkcs11 read/write sessions
  * @object_list - List of the objects owned by the token
  * @db_main - Volatile copy of the persistent main database
  * @db_objs - Volatile copy of the persistent object database
+ * @is_db_init - if db was loaded to RAM, this value equals '1'
  */
 struct ck_token {
+	TAILQ_ENTRY(ck_token) link;
+	TEE_Identity token_db_id;
 	enum pkcs11_token_state state;
+	uint32_t ref_count;
 	uint32_t session_count;
 	uint32_t rw_session_count;
 	struct object_list object_list;
 	/* Copy in RAM of the persistent database */
 	struct token_persistent_main *db_main;
 	struct token_persistent_objs *db_objs;
+};
+
+/*
+ * Tokens related to a particular CA
+ *
+ * @token - ck token
+ * @slot - plcs11 slot where ck token was inserted
+ */
+struct client_token {
+	TAILQ_ENTRY(client_token) link;
+	struct ck_token *token;
+	uint32_t slot;
 };
 
 /*
@@ -186,21 +209,24 @@ struct pkcs11_session {
 	struct pkcs11_find_objects *find_ctx;
 };
 
-/* Initialize static token instance(s) from default/persistent database */
+/* Init/deinit pkcs11 and create a "SYSTEM" token */
 TEE_Result pkcs11_init(void);
 void pkcs11_deinit(void);
 
-/* Speculation safe lookup of token instance from token identifier */
-struct ck_token *get_token(unsigned int token_id);
+/* Add token to common list of all tokens */
+struct ck_token *create_token(TEE_Identity *token_db_id);
+void remove_token(struct ck_token *token);
 
-/* Return token identified from token instance address */
-unsigned int get_token_id(struct ck_token *token);
+/* Return pointer to a temporary list of tokens for CA */
+void *reg_in_temp_ca_token_list(struct ck_token *token,
+				char client_salt[CLIENT_SALT_SIZE]);
+void remove_temp_ca_token_list(void *ca_token_temp_list);
 
 /* Return client's (shared) object handle database associated with session */
 struct handle_db *get_object_handle_db(struct pkcs11_session *session);
 
 /* Access to persistent database */
-struct ck_token *init_persistent_db(unsigned int token_id);
+struct ck_token *init_persistent_db(struct ck_token *token);
 void update_persistent_db(struct ck_token *token);
 void close_persistent_db(struct ck_token *token);
 
@@ -264,7 +290,7 @@ enum pkcs11_rc get_persistent_objects_list(struct ck_token *token,
  */
 struct session_list *get_session_list(struct pkcs11_session *session);
 struct pkcs11_client *tee_session2client(void *tee_session);
-struct pkcs11_client *register_client(void);
+struct pkcs11_client *register_client(void *ca_token_temp_list);
 void unregister_client(struct pkcs11_client *client);
 
 struct pkcs11_session *pkcs11_handle2session(uint32_t handle,
@@ -317,11 +343,16 @@ struct ck_token *pkcs11_session2token(struct pkcs11_session *session)
 }
 
 /* Entry point for the TA commands */
-enum pkcs11_rc entry_ck_slot_list(uint32_t ptypes, TEE_Param *params);
-enum pkcs11_rc entry_ck_slot_info(uint32_t ptypes, TEE_Param *params);
-enum pkcs11_rc entry_ck_token_info(uint32_t ptypes, TEE_Param *params);
-enum pkcs11_rc entry_ck_token_mecha_ids(uint32_t ptypes, TEE_Param *params);
-enum pkcs11_rc entry_ck_token_mecha_info(uint32_t ptypes, TEE_Param *params);
+enum pkcs11_rc entry_ck_slot_list(struct pkcs11_client *client,
+				  uint32_t ptypes, TEE_Param *params);
+enum pkcs11_rc entry_ck_slot_info(struct pkcs11_client *client,
+				  uint32_t ptypes, TEE_Param *params);
+enum pkcs11_rc entry_ck_token_info(struct pkcs11_client *client,
+				   uint32_t ptypes, TEE_Param *params);
+enum pkcs11_rc entry_ck_token_mecha_ids(struct pkcs11_client *client,
+					uint32_t ptypes, TEE_Param *params);
+enum pkcs11_rc entry_ck_token_mecha_info(struct pkcs11_client *client,
+					 uint32_t ptypes, TEE_Param *params);
 enum pkcs11_rc entry_ck_open_session(struct pkcs11_client *client,
 				     uint32_t ptypes, TEE_Param *params);
 enum pkcs11_rc entry_ck_close_session(struct pkcs11_client *client,
@@ -330,7 +361,8 @@ enum pkcs11_rc entry_ck_close_all_sessions(struct pkcs11_client *client,
 					   uint32_t ptypes, TEE_Param *params);
 enum pkcs11_rc entry_ck_session_info(struct pkcs11_client *client,
 				     uint32_t ptypes, TEE_Param *params);
-enum pkcs11_rc entry_ck_token_initialize(uint32_t ptypes, TEE_Param *params);
+enum pkcs11_rc entry_ck_token_initialize(struct pkcs11_client *client,
+					 uint32_t ptypes, TEE_Param *params);
 enum pkcs11_rc entry_ck_init_pin(struct pkcs11_client *client,
 				 uint32_t ptypes, TEE_Param *params);
 enum pkcs11_rc entry_ck_set_pin(struct pkcs11_client *client,
