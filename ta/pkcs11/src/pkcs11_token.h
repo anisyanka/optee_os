@@ -15,6 +15,7 @@
 #include "pkcs11_attributes.h"
 
 #define CLIENT_SALT_SIZE		16
+#define TOKEN_SERIAL_NUM_SIZE	16
 
 /* Hard coded description */
 #define PKCS11_SLOT_DESCRIPTION		"OP-TEE PKCS11 TA"
@@ -99,6 +100,7 @@ struct token_persistent_objs {
  * @ref_count - reference counter
  * @session_count - Counter for opened Pkcs11 sessions
  * @rw_session_count - Count for opened Pkcs11 read/write sessions
+ * @sn - serial number of token. Apps can use it to choose particular token
  * @object_list - List of the objects owned by the token
  * @db_main - Volatile copy of the persistent main database
  * @db_objs - Volatile copy of the persistent object database
@@ -111,6 +113,7 @@ struct ck_token {
 	uint32_t ref_count;
 	uint32_t session_count;
 	uint32_t rw_session_count;
+	char sn[TOKEN_SERIAL_NUM_SIZE];
 	struct object_list object_list;
 	/* Copy in RAM of the persistent database */
 	struct token_persistent_main *db_main;

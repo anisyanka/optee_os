@@ -151,6 +151,20 @@ struct ck_token *create_token(TEE_Identity *token_db_id)
 	token->rw_session_count = 0;
 	token->ref_count = 1;
 
+	switch (token_db_id->login) {
+	case TEE_LOGIN_USER:
+		TEE_MemMove(token->sn, "USER", sizeof("USER"));
+		break;
+	case TEE_LOGIN_APPLICATION:
+		TEE_MemMove(token->sn, "APP", sizeof("APP"));
+		break;
+	case TEE_LOGIN_APPLICATION_USER:
+		TEE_MemMove(token->sn, "USERAPP", sizeof("USERAPP"));
+		break;
+	default:
+		break;
+	}
+
 	TEE_MemMove(&token->token_db_id, token_db_id, sizeof(TEE_Identity));
 
 	/* Insert a new token to common list of all tokens */
@@ -565,8 +579,6 @@ enum pkcs11_rc entry_ck_token_info(struct pkcs11_client *client,
 		.hardware_version = PKCS11_TOKEN_HW_VERSION,
 		.firmware_version = PKCS11_TOKEN_FW_VERSION,
 	};
-	char sn[sizeof(info.serial_number) + 1] = { 0 };
-	int n = 0;
 
 	if (!client || ptypes != exp_pt || out->memref.size != sizeof(info))
 		return PKCS11_CKR_ARGUMENTS_BAD;
@@ -587,14 +599,7 @@ enum pkcs11_rc entry_ck_token_info(struct pkcs11_client *client,
 	pad_str(info.manufacturer_id, sizeof(info.manufacturer_id));
 	pad_str(info.model, sizeof(info.model));
 
-	n = snprintf(sn, sizeof(sn), "%0*"PRIu32,
-		     (int)sizeof(info.serial_number), token_id);
-	if (n != (int)sizeof(info.serial_number))
-		TEE_Panic(0);
-
-	TEE_MemMove(info.serial_number, sn, sizeof(info.serial_number));
-	pad_str(info.serial_number, sizeof(info.serial_number));
-
+	TEE_MemMove(info.serial_number, token->sn, sizeof(info.serial_number));
 	TEE_MemMove(info.label, token->db_main->label, sizeof(info.label));
 
 	info.flags = token->db_main->flags;
