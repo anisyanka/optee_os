@@ -24,6 +24,31 @@
 #include "serializer.h"
 #include "token_capabilities.h"
 
+#ifdef PKCS11_SLOT_DESCRIPTION
+#undef PKCS11_SLOT_DESCRIPTION
+#define PKCS11_SLOT_DESCRIPTION		"Aurora PKCS11 TA"
+#endif
+
+#ifdef PKCS11_SLOT_MANUFACTURER
+#undef PKCS11_SLOT_MANUFACTURER
+#define PKCS11_SLOT_MANUFACTURER	"Open Mobile Platform"
+#endif
+
+#ifdef PKCS11_TOKEN_LABEL
+#undef PKCS11_TOKEN_LABEL
+#define PKCS11_TOKEN_LABEL		"Aurora PKCS#11 TA token"
+#endif
+
+#ifdef PKCS11_TOKEN_MANUFACTURER
+#undef PKCS11_TOKEN_MANUFACTURER
+#define PKCS11_TOKEN_MANUFACTURER	PKCS11_SLOT_MANUFACTURER
+#endif
+
+#ifdef PKCS11_TOKEN_MODEL
+#undef PKCS11_TOKEN_MODEL
+#define PKCS11_TOKEN_MODEL		"Aurora TA"
+#endif
+
 /* RNG chunk size used to split RNG generation to smaller sizes */
 #define RNG_CHUNK_SIZE		512U
 
